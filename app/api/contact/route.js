@@ -1,38 +1,46 @@
 import { NextResponse } from "next/server";
 
-// CORS — add this
+// CORS — chỉ cho phép gọi từ frontend của m
 const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || "*";
 
-// Rate limit
+// Ratelimit
 const RATE_LIMIT = new Map();
-const WINDOW_MS = 10_000; 
-const MAX_REQUESTS = 3;   
+const WINDOW_MS = 10_000; // 10 giây
+const MAX_REQUESTS = 3;   // Mỗi IP chỉ được 3 req / 10 giây
+
+// Hàm thêm CORS header
+function withCors(res) {
+  res.headers.set("Access-Control-Allow-Origin", FRONTEND_ORIGIN);
+  res.headers.set("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.headers.set("Access-Control-Allow-Headers", "Content-Type");
+  return res;
+}
+
+export async function OPTIONS() {
+  return withCors(new NextResponse(null, { status: 200 }));
+}
 
 export async function POST(req) {
   try {
-    // Content-type check
     const contentType = req.headers.get("content-type") || "";
-    if (!contentType.includes("application/json")) {
+    if (!contentType.includes("application/json"))
       return withCors(NextResponse.json({ ok: false, error: "Invalid content type" }, { status: 400 }));
-    }
 
-    // IP + UA
     const ip = req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || "0.0.0.0";
     const ua = req.headers.get("user-agent") || "unknown";
 
-    // ---- Rate limit ----
+    // RATE LIMIT
     const now = Date.now();
     const history = RATE_LIMIT.get(ip) || [];
-    const recent = history.filter((t) => now - t < WINDOW_MS);
+    const recent = history.filter(t => now - t < WINDOW_MS);
 
-    if (recent.length >= MAX_REQUESTS) {
+    if (recent.length >= MAX_REQUESTS)
       return withCors(NextResponse.json({ ok: false, error: "Too many requests" }, { status: 429 }));
-    }
 
     recent.push(now);
     RATE_LIMIT.set(ip, recent);
 
-    // ---- Parse JSON ----
+    // JSON CHECK
     let body;
     try {
       body = await req.json();
@@ -40,46 +48,42 @@ export async function POST(req) {
       return withCors(NextResponse.json({ ok: false, error: "Invalid JSON" }, { status: 400 }));
     }
 
-    const { message, turnstileToken } = body || {};
+    const { name, contact, message, turnstileToken } = body || {};
 
-    if (!message || typeof message !== "string" || !turnstileToken) {
+    if (!name || !contact || !message || !turnstileToken)
       return withCors(NextResponse.json({ ok: false, error: "Missing fields" }, { status: 400 }));
+
+    // Clean dangerous characters
+    function clean(x) {
+      return String(x)
+        .trim()
+        .replace(/<[^>]*>/g, "")
+        .slice(0, 500);
     }
 
-    // ---- Turnstile verify ----
-    const tsRes = await fetch(
-      "https://challenges.cloudflare.com/turnstile/v0/siteverify",
-      {
-        method: "POST",
-        body: new URLSearchParams({
-          secret: process.env.TURNSTILE_SECRET,
-          response: turnstileToken,
-          remoteip: ip
-        }),
-      }
-    ).then((r) => r.json());
+    const cleanName = clean(name);
+    const cleanContact = clean(contact);
+    const cleanMessage = clean(message);
 
-    if (!tsRes.success) {
+    // VERIFY TURNSTILE
+    const tsRes = await fetch("https://challenges.cloudflare.com/turnstile/v0/siteverify", {
+      method: "POST",
+      body: new URLSearchParams({
+        secret: process.env.TURNSTILE_SECRET,
+        response: turnstileToken,
+        remoteip: ip
+      })
+    }).then(r => r.json());
+
+    if (!tsRes.success)
       return withCors(NextResponse.json({ ok: false, error: "Bot detected" }, { status: 403 }));
-    }
 
-    // ---- Clean message ----
-    let cleanMsg = message.trim();
-    cleanMsg = cleanMsg.replace(/<[^>]*>/g, "");
-    if (cleanMsg.length > 500) {
-      cleanMsg = cleanMsg.slice(0, 500) + " ...[truncated]";
-    }
-
-    if (cleanMsg.length === 0) {
-      return withCors(NextResponse.json({ ok: false, error: "Empty message" }, { status: 400 }));
-    }
-
-    // ---- Discord ----
+    // SEND DISCORD MESSAGE
     const discordToken = process.env.DISCORD_BOT_TOKEN;
     const channelId = process.env.DISCORD_CHANNEL_ID;
 
     if (!discordToken || !channelId) {
-      console.error("Missing Discord env");
+      console.error("Missing Discord configs");
       return withCors(NextResponse.json({ ok: false, error: "Server misconfig" }, { status: 500 }));
     }
 
@@ -93,47 +97,26 @@ export async function POST(req) {
         },
         body: JSON.stringify({
           content:
-            `📩 **New message from contact form**\n\n` +
-            `**Message:** ${cleanMsg}\n` +
-            `**IP:** ${ip}\n` +
-            `**UA:** ${ua}`,
+            `📩 **New Contact Message**\n\n` +
+            `👤 **Name:** ${cleanName}\n` +
+            `🔗 **Contact:** ${cleanContact}\n` +
+            `💬 **Message:**\n${cleanMessage}\n\n` +
+            `🌐 **IP:** ${ip}\n` +
+            `🖥️ **UA:** ${ua}`
         }),
       }
     );
 
     if (!discordRes.ok) {
-      console.error("Discord error", await discordRes.text());
+      console.error(await discordRes.text());
       return withCors(NextResponse.json({ ok: false, error: "Discord error" }, { status: 502 }));
     }
 
     return withCors(NextResponse.json({ ok: true }));
 
   } catch (err) {
-    console.error("contact route error", err);
+    console.error(err);
     return withCors(NextResponse.json({ ok: false, error: "Server error" }, { status: 500 }));
   }
 }
 
-// ----- CORS HANDLER -----
-export async function OPTIONS() {
-  const res = new NextResponse(null, { status: 204 });
-  res.headers.set("Access-Control-Allow-Origin", FRONTEND_ORIGIN);
-  res.headers.set("Access-Control-Allow-Methods", "POST, OPTIONS");
-  res.headers.set("Access-Control-Allow-Headers", "Content-Type");
-  return res;
-}
-
-// ----- Function để gắn CORS vào mọi response -----
-function withCors(response) {
-  response.headers.set("Access-Control-Allow-Origin", FRONTEND_ORIGIN);
-  response.headers.set("Access-Control-Allow-Methods", "POST, OPTIONS");
-  response.headers.set("Access-Control-Allow-Headers", "Content-Type");
-  return response;
-}
-
-// Block GET
-export function GET() {
-  return withCors(
-    NextResponse.json({ ok: false, error: "Method not allowed" }, { status: 405 })
-  );
-}
